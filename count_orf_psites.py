@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Count strand-specific P-sites in the three frames of spliced ORFs.
 
-Python 3.9+; standard library only. Run with --help for arguments and an example.
+Python 3.9+; PDF plots require NumPy and Matplotlib (pip install matplotlib).
+Run with --help for arguments and an example.
 """
 
 import argparse
@@ -15,6 +16,7 @@ import re
 import sys
 
 METADATA = ('orf_id', 'orf_biotype', 'transcript_id', 'gene_id', 'gene_name')
+SPECIFICITY = ('max_tissue_translation', 'tau_tissue_translation')
 BIN_SIZE = 16384
 ATTRIBUTE = re.compile(r'(\w+)\s+"([^"\r\n]*)"')
 
@@ -54,7 +56,7 @@ def read_gtf(path):
             segments.add((start, end))  # Exact duplicate records count once.
     if not orfs:
         raise ValueError(f'{path}: no CDS records with ORF annotations found')
-    rows = []
+    rows, lengths = [], []
     index = defaultdict(lambda: defaultdict(list))
     for row_number, (key, (metadata, chrom, strand, segments)) in enumerate(orfs.items()):
         ordered = sorted(segments)
@@ -64,16 +66,22 @@ def read_gtf(path):
             ordered.reverse()
         offset = 0
         for start, end in ordered:
-            block = (start, end, offset % 3, row_number)
+            block = (start, end, offset, row_number)
             for bin_id in range(start // BIN_SIZE, (end - 1) // BIN_SIZE + 1):
                 index[(chrom, strand)][bin_id].append(block)
             offset += end - start
         rows.append(metadata)
+        lengths.append(offset)
     repeated = sum(n > 1 for n in Counter(row[0] for row in rows).values())
     if repeated:
         print(f'Note: {repeated} ORF IDs occur in multiple transcripts; '
               'keeping separate (orf_id, transcript_id) rows.', file=sys.stderr)
-    return rows, index
+    incomplete = sum(length % 3 != 0 for length in lengths)
+    if incomplete:
+        print(f'Warning: {incomplete} ORFs have CDS length not divisible by three; '
+              'coverage uses the actual number of p0 positions (ceil(length/3)).',
+              file=sys.stderr)
+    return rows, index, lengths
 
 
 def read_bedgraph_list(path):
@@ -89,8 +97,9 @@ def read_bedgraph_list(path):
             if len(fields) != 3 or fields[2].lower() not in aliases:
                 raise ValueError(f'{where}: expected bedgraph_path tissue plus|minus')
             filename, tissue, strand_text = fields
-            if tissue in METADATA:
-                raise ValueError(f'{where}: tissue name conflicts with metadata column')
+            if tissue in METADATA + SPECIFICITY or ';' in tissue or tissue == 'NA':
+                raise ValueError(f'{where}: tissue name conflicts with output columns '
+                                 'or reserved specificity notation (NA or ;)')
             bedgraph = Path(filename).expanduser()
             if not bedgraph.is_absolute():
                 bedgraph = Path(path).resolve().parent / bedgraph
@@ -111,7 +120,7 @@ def read_bedgraph_list(path):
     return samples
 
 
-def count_bedgraph(path, strand, index, counts):
+def count_bedgraph(path, strand, index, counts, covered=None):
     """Count residues modulo three without expanding bedGraph intervals to bases."""
     matched, chromosomes = False, set()
     with open_text(path) as handle:
@@ -137,11 +146,17 @@ def count_bedgraph(path, strand, index, counts):
                     if lo >= hi or bin_id != lo // BIN_SIZE:
                         continue
                     matched = True
-                    first = (offset + (lo - exon_start if strand == '+' else exon_end - hi)) % 3
+                    transcript_start = offset + (lo - exon_start if strand == '+' else exon_end - hi)
+                    first = transcript_start % 3
                     length = hi - lo
                     for frame in range(3):
                         bases = (length + 2 - (frame - first) % 3) // 3
                         counts[3 * row + frame] += bases * value
+                    if covered is not None:
+                        # Pool positive p0 positions across overlapping records/files.
+                        begin = (transcript_start + 2) // 3
+                        stop = (transcript_start + length + 2) // 3
+                        covered[row][begin:stop] = b'\x01' * (stop - begin)
     missing = chromosomes - {chrom for chrom, s in index if s == strand}
     if missing:
         print(f'Note: {path.name}: {len(missing)} chromosome(s) have no {strand} CDS '
@@ -167,6 +182,21 @@ def report_cds_frames(tissue, rows, counts):
           file=sys.stderr, flush=True)
 
 
+def tissue_specificity(values, tissues):
+    """Tau on linear normalized counts; retain every exactly tied maximum."""
+    maximum = max(values)
+    if maximum == 0:
+        return (), math.nan
+    winners = tuple(tissue for tissue, value in zip(tissues, values) if value == maximum)
+    tau = (math.fsum(1 - value / maximum for value in values) / (len(values) - 1)
+           if len(values) > 1 else math.nan)
+    return winners, min(1.0, max(0.0, tau)) if math.isfinite(tau) else tau
+
+
+def format_metric(value):
+    return format(value, '.15g') if math.isfinite(value) else 'NA'
+
+
 def write_tables(prefix, rows, samples, counts, target_total):
     """Use one normalization factor per tissue, shared across all three frames."""
     factors = {}
@@ -178,22 +208,186 @@ def write_tables(prefix, rows, samples, counts, target_total):
         print(f'{tissue}: assigned total={total:.12g}; normalization factor='
               f'{factors[tissue]:.12g}', file=sys.stderr)
     Path(prefix).parent.mkdir(parents=True, exist_ok=True)
+    p0_specificity = []
     for frame in range(3):
         for normalized in (False, True):
             suffix = '.normalized' if normalized else ''
             path = f'{prefix}.p{frame}{suffix}.tsv'
             with open(path, 'w', newline='', encoding='utf-8') as handle:
                 writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
-                writer.writerow((*METADATA, *samples))
+                writer.writerow((*METADATA, *samples, *(SPECIFICITY if normalized else ())))
                 for row_number, metadata in enumerate(rows):
-                    values = []
-                    for tissue in samples:
-                        value = counts[tissue][3 * row_number + frame]
-                        if normalized:
-                            value *= factors[tissue]
-                        values.append(format(value, '.15g'))
-                    writer.writerow((*metadata, *values))
+                    values = [counts[tissue][3 * row_number + frame] *
+                              (factors[tissue] if normalized else 1.0) for tissue in samples]
+                    extra = ()
+                    if normalized:
+                        winners, tau = tissue_specificity(values, samples)
+                        extra = (';'.join(winners) if winners else 'NA', format_metric(tau))
+                        if frame == 0:
+                            p0_specificity.append((winners, tau))
+                    writer.writerow((*metadata, *(format_metric(v) for v in values), *extra))
             print(f'Wrote {path}', file=sys.stderr)
+    return p0_specificity
+
+
+def write_quality_table(prefix, rows, samples, counts, coverage):
+    """Write p0/all-frame periodicity and distinct-p0-position coverage."""
+    periodicity = {}
+    for tissue in samples:
+        values = array('d')
+        for row in range(len(rows)):
+            total = math.fsum(counts[tissue][3 * row:3 * row + 3])
+            values.append(counts[tissue][3 * row] / total if total else math.nan)
+        periodicity[tissue] = values
+    path = f'{prefix}.periodicity_coverage.tsv'
+    with open(path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+        writer.writerow((*METADATA, *(f'{tissue}_{metric}' for tissue in samples
+                                      for metric in ('periodicity', 'coverage'))))
+        for row, metadata in enumerate(rows):
+            writer.writerow((*metadata, *(format_metric(metric[tissue][row])
+                                          for tissue in samples
+                                          for metric in (periodicity, coverage))))
+    print(f'Wrote {path}', file=sys.stderr)
+    return periodicity
+
+
+def load_plotting():
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as error:
+        raise ValueError('PDF plots require NumPy and Matplotlib; install with '
+                         'python -m pip install matplotlib, or use --skip-plots') from error
+    return np, plt
+
+
+def plot_density_panel(ax, values, np):
+    """Binned Gaussian KDE, reflected at 0 and 1; no density for point masses."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    ax.set_xlim(0, 1)
+    ax.set_ylim(bottom=0)
+    ax.set_xticks([0, 0.5, 1])
+    ax.text(0.97, 0.95, f'n={len(values):,}', transform=ax.transAxes,
+            ha='right', va='top', fontsize=8)
+    if not len(values):
+        ax.text(0.5, 0.5, 'No defined values', transform=ax.transAxes,
+                ha='center', fontsize=8)
+        return
+    if np.all(values == values[0]):
+        ax.axvline(values[0], color='#2878a5', linewidth=2, clip_on=False)
+        ax.text(0.5, 0.5, f'All = {values[0]:.3g}', transform=ax.transAxes,
+                ha='center', fontsize=8)
+        return
+    bins = 256
+    hist, edges = np.histogram(values, bins=bins, range=(0, 1), density=True)
+    centers = (edges[:-1] + edges[1:]) / 2
+    # Scott bandwidth with a bin-width floor. Binning keeps large panels fast.
+    bandwidth = max(float(np.std(values, ddof=1)) * len(values) ** (-0.2), 1 / bins)
+    radius = min(bins, int(math.ceil(4 * bandwidth * bins)))
+    offsets = np.arange(-radius, radius + 1) / bins
+    kernel = np.exp(-0.5 * (offsets / bandwidth) ** 2)
+    kernel /= kernel.sum()
+    padded = np.concatenate((hist[::-1], hist, hist[::-1]))
+    density = np.convolve(padded, kernel, mode='same')[bins:2 * bins]
+    x = np.concatenate(([0], centers, [1]))
+    y = np.concatenate(([density[0]], density, [density[-1]]))
+    ax.plot(x, y, color='#2878a5', linewidth=1.2)
+    ax.fill_between(x, y, color='#2878a5', alpha=0.25)
+
+
+def write_density_plots(prefix, rows, samples, periodicity, coverage, specificity):
+    np, plt = load_plotting()
+    tissues = list(samples)
+    biotypes = list(dict.fromkeys(row[1] for row in rows))
+    by_biotype = {biotype: [] for biotype in biotypes}
+    tau_groups = defaultdict(list)
+    for i, row in enumerate(rows):
+        by_biotype[row[1]].append(i)
+        _, tau = specificity[i]
+        if math.isfinite(tau):
+            tau_groups[row[1]].append(tau)
+    for metric, label, data in (
+            ('periodicity', 'Periodicity (p0 / all frames)', periodicity),
+            ('coverage', 'Coverage (covered p0 positions / all p0 positions)', coverage),
+            ('tau_tissue_translation', 'Tissue specificity (tau, normalized p0)', None)):
+        columns = ['All tissues'] if data is None else tissues
+        fig, axes = plt.subplots(len(biotypes), len(columns), squeeze=False,
+                                 figsize=(max(4, 2.6 * len(columns)), 2.1 * len(biotypes) + 1),
+                                 sharex=True)
+        for r, biotype in enumerate(biotypes):
+            for c, tissue in enumerate(columns):
+                ax = axes[r, c]
+                values = ([data[tissue][i] for i in by_biotype[biotype]] if data is not None
+                          else tau_groups[biotype])
+                plot_density_panel(ax, values, np)
+                if r == 0:
+                    ax.set_title(tissue, fontsize=10)
+                if c == 0:
+                    ax.set_ylabel(f'{biotype}\nDensity', fontsize=9)
+                if r == len(biotypes) - 1:
+                    ax.set_xlabel('Tau' if data is None else metric.capitalize())
+        fig.suptitle(label, fontsize=12)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        path = f'{prefix}.{metric}.density.pdf'
+        fig.savefig(path, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Wrote {path}', file=sys.stderr)
+
+
+def count_tissue_enrichment(rows, specificity):
+    """Count nested strict tau thresholds in each maximum-translation tissue."""
+    enriched, specific = Counter(), Counter()
+    for metadata, (winners, tau) in zip(rows, specificity):
+        if not math.isfinite(tau):
+            continue
+        for tissue in winners:
+            key = (metadata[1], tissue)
+            if tau > 0.8:
+                enriched[key] += 1
+            if tau > 0.95:
+                specific[key] += 1
+    return enriched, specific
+
+
+def write_enrichment_barplot(prefix, rows, samples, specificity):
+    np, plt = load_plotting()
+    from matplotlib.ticker import MaxNLocator
+
+    tissues = list(samples)
+    biotypes = list(dict.fromkeys(row[1] for row in rows))
+    enriched, specific = count_tissue_enrichment(rows, specificity)
+    fig, axes = plt.subplots(len(biotypes), 1, squeeze=False, sharex=True,
+                             figsize=(max(6, 1.2 * len(tissues)), 2.5 * len(biotypes) + 1.5))
+    x = np.arange(len(tissues))
+    for r, biotype in enumerate(biotypes):
+        ax = axes[r, 0]
+        for offset, counts, label, color in (
+                (-0.2, enriched, 'Tissue-enriched (tau > 0.8)', '#2878a5'),
+                (0.2, specific, 'Tissue-specific (tau > 0.95)', '#e58b38')):
+            bars = ax.bar(x + offset, [counts[(biotype, tissue)] for tissue in tissues],
+                          width=0.4, label=label, color=color)
+            ax.bar_label(bars, padding=3, fontsize=8)
+        ax.set_ylabel(f'{biotype}\nNumber of ORFs')
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        maximum = max((enriched[(biotype, tissue)] for tissue in tissues), default=0)
+        ax.set_ylim(0, max(1, maximum * 1.2))
+        ax.set_xticks(x)
+        ax.set_xticklabels(tissues, rotation=45, ha='right')
+    axes[-1, 0].set_xlabel('Tissue of maximum normalized p0 translation')
+    fig.suptitle('Tissue-enriched and tissue-specific ORFs by biotype', fontsize=12)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.96), ncol=2)
+    fig.text(0.5, 0.01, 'Specific ORFs are included in enriched counts; tied maxima count in each tied tissue.',
+             ha='center', fontsize=8)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.91))
+    path = f'{prefix}.tissue_enrichment.barplot.pdf'
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Wrote {path}', file=sys.stderr)
 
 
 def main():
@@ -233,6 +427,37 @@ Rows and normalization:
   overlapping ORFs), not all P-sites in the input library. Zero-total tissues
   stay zero with a warning. No length normalization is applied.
 
+Tissue specificity and translation quality:
+  Each normalized frame table adds max_tissue_translation (tissue name) and
+  tau_tissue_translation, calculated independently from that frame's normalized
+  linear counts: tau = sum(1 - x_tissue / max(x)) / (number_of_tissues - 1).
+  Tau ranges from 0 (uniform) to 1 (one tissue). All-zero rows have NA for both
+  columns; tau is also NA with only one tissue. Tied maxima are joined with ';'.
+  Raw count tables retain their original columns.
+  Periodicity = p0 / (p0+p1+p2), or NA when no P-sites are assigned.
+  Coverage = distinct p0 positions with positive counts / total p0 positions.
+  Positive fractional bedGraph values count as observed; repeated positions
+  across intervals/files count once. Coverage is zero when no p0 sites occur.
+  The denominator is CDS nucleotide length / 3 for complete ORFs, or ceil(length/3)
+  for incomplete codons, counting all actual p0 positions. Introns are excluded.
+  Quality tables keep the same (orf_id, transcript_id) rows as the count tables.
+
+Density PDFs:
+  Periodicity/coverage have tissue columns and orf_biotype rows. Each panel
+  reports its defined-value count.
+  Binned Gaussian densities are reflected at the [0,1] boundaries; constant
+  groups are drawn as vertical lines. NA values are omitted, zeros retained.
+  Tau uses normalized p0 counts across tissues, with one panel per biotype.
+  Each ORF contributes its single tau score once, without tissue subdivision.
+  The barplot shows ORF counts by tissue (x axis) and biotype (panel rows):
+  tissue-enriched = tau > 0.8; tissue-specific = tau > 0.95 (strict thresholds).
+  These are nested groups: specific ORFs are also included in enriched counts.
+  ORFs are assigned to their maximum normalized p0 tissue; tied maxima count
+  in each tied tissue. Undefined tau values are excluded. Counts use the same
+  (orf_id, transcript_id) rows as the tables.
+  Install plotting dependencies with: python -m pip install matplotlib
+  Use --skip-plots to generate only the TSV tables without plotting dependencies.
+
 Progress report (stderr):
   After all files for each tissue are counted, report p0/p1/p2 percentages from
   summed raw counts over rows with orf_biotype exactly CDS, combining strands.
@@ -243,6 +468,9 @@ Progress report (stderr):
 Outputs (existing files with these names are overwritten):
   PREFIX.p0.tsv, PREFIX.p1.tsv, PREFIX.p2.tsv
   PREFIX.p0.normalized.tsv, PREFIX.p1.normalized.tsv, PREFIX.p2.normalized.tsv
+  PREFIX.periodicity_coverage.tsv (metadata, TISSUE_periodicity, TISSUE_coverage, ...)
+  PREFIX.periodicity.density.pdf, PREFIX.coverage.density.pdf
+  PREFIX.tau_tissue_translation.density.pdf, PREFIX.tissue_enrichment.barplot.pdf
 ''')
     parser.add_argument('--gtf', required=True, type=Path,
                         help='ORF GTF: CDS features with orf_id/transcript_id attributes')
@@ -252,21 +480,35 @@ Outputs (existing files with these names are overwritten):
                         help='output path prefix, e.g. results/nicos_psites')
     parser.add_argument('--target-total', type=float, default=1_000_000,
                         help='normalized total across all ORFs and frames per tissue (default: 1000000)')
+    parser.add_argument('--skip-plots', action='store_true',
+                        help='write all TSVs without requiring plotting dependencies')
     args = parser.parse_args()
     if not math.isfinite(args.target_total) or args.target_total <= 0:
         parser.error('--target-total must be finite and greater than zero')
     try:
+        if not args.skip_plots:
+            load_plotting()  # Fail before expensive counting if dependencies are missing.
         samples = read_bedgraph_list(args.bedgraphs)
-        rows, index = read_gtf(args.gtf)
+        rows, index, lengths = read_gtf(args.gtf)
         print(f'Loaded {len(rows)} ORF/transcript rows and {len(samples)} tissues.', file=sys.stderr)
-        counts = {}
+        counts, coverage = {}, {}
+        p0_positions = [(length + 2) // 3 for length in lengths]
         for tissue, entries in samples.items():
             counts[tissue] = array('d', [0.0]) * (3 * len(rows))
+            covered = [bytearray(size) for size in p0_positions]
             for path, strand in entries:
                 print(f'Counting {tissue} ({strand}): {path}', file=sys.stderr)
-                count_bedgraph(path, strand, index, counts[tissue])
+                count_bedgraph(path, strand, index, counts[tissue], covered)
+            coverage[tissue] = array('d', (bitmap.count(1) / size
+                                           for bitmap, size in zip(covered, p0_positions)))
+            del covered
             report_cds_frames(tissue, rows, counts[tissue])
-        write_tables(args.out_prefix, rows, samples, counts, args.target_total)
+        specificity = write_tables(args.out_prefix, rows, samples, counts, args.target_total)
+        periodicity = write_quality_table(args.out_prefix, rows, samples, counts, coverage)
+        if not args.skip_plots:
+            write_density_plots(args.out_prefix, rows, samples, periodicity, coverage,
+                                specificity)
+            write_enrichment_barplot(args.out_prefix, rows, samples, specificity)
     except (OSError, ValueError, OverflowError) as error:
         parser.exit(1, f'Error: {error}\n')
 
