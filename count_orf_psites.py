@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count strand-specific P-sites in the three frames of spliced ORFs.
+"""Count strand-specific ribosome P-sites or RNA-seq reads in spliced ORFs.
 
 Python 3.9+; PDF plots require NumPy and Matplotlib (pip install matplotlib).
 Run with --help for arguments and an example.
@@ -17,6 +17,7 @@ import sys
 
 METADATA = ('orf_id', 'orf_biotype', 'transcript_id', 'gene_id', 'gene_name')
 SPECIFICITY = ('max_tissue_translation', 'tau_tissue_translation')
+RNA_SPECIFICITY = ('max_tissue_expression', 'tau_tissue_expression')
 BIN_SIZE = 16384
 ATTRIBUTE = re.compile(r'(\w+)\s+"([^"\r\n]*)"')
 
@@ -26,7 +27,7 @@ def open_text(path):
     return opener(path, 'rt', encoding='utf-8-sig')
 
 
-def read_gtf(path):
+def read_gtf(path, reads='ribo'):
     """Group CDS by (orf_id, transcript_id) and index exon-aware frame offsets."""
     orfs = {}
     with open_text(path) as handle:
@@ -77,7 +78,7 @@ def read_gtf(path):
         print(f'Note: {repeated} ORF IDs occur in multiple transcripts; '
               'keeping separate (orf_id, transcript_id) rows.', file=sys.stderr)
     incomplete = sum(length % 3 != 0 for length in lengths)
-    if incomplete:
+    if incomplete and reads == 'ribo':
         print(f'Warning: {incomplete} ORFs have CDS length not divisible by three; '
               'coverage uses the actual number of p0 positions (ceil(length/3)).',
               file=sys.stderr)
@@ -97,7 +98,7 @@ def read_bedgraph_list(path):
             if len(fields) != 3 or fields[2].lower() not in aliases:
                 raise ValueError(f'{where}: expected bedgraph_path tissue plus|minus')
             filename, tissue, strand_text = fields
-            if tissue in METADATA + SPECIFICITY or ';' in tissue or tissue == 'NA':
+            if tissue in METADATA + SPECIFICITY + RNA_SPECIFICITY or ';' in tissue or tissue == 'NA':
                 raise ValueError(f'{where}: tissue name conflicts with output columns '
                                  'or reserved specificity notation (NA or ;)')
             bedgraph = Path(filename).expanduser()
@@ -118,6 +119,74 @@ def read_bedgraph_list(path):
             print(f'Warning: {tissue} has only one strand; the other gets zero counts.',
                   file=sys.stderr)
     return samples
+
+
+def read_bam_list(path):
+    """Read whitespace-separated BAM path and tissue; pool files per tissue."""
+    samples, seen = {}, set()
+    with open_text(path) as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            fields = line.split()
+            where = f'{path}:{line_number}'
+            if len(fields) != 2:
+                raise ValueError(f'{where}: expected bam_path tissue')
+            filename, tissue = fields
+            if tissue in METADATA + SPECIFICITY + RNA_SPECIFICITY or ';' in tissue or tissue == 'NA':
+                raise ValueError(f'{where}: reserved tissue name')
+            bam = Path(filename).expanduser()
+            if not bam.is_absolute():
+                bam = Path(path).resolve().parent / bam
+            if not bam.is_file():
+                raise ValueError(f'{where}: BAM not found: {bam}')
+            identity = (bam.resolve(), tissue)
+            if identity in seen:
+                raise ValueError(f'{where}: duplicate BAM/tissue entry')
+            seen.add(identity)
+            samples.setdefault(tissue, []).append(bam)
+    if not samples:
+        raise ValueError(f'{path}: empty BAM list')
+    return samples
+
+
+def load_bam_reader():
+    try:
+        import pysam
+    except ImportError as error:
+        raise ValueError('RNA mode requires pysam; install with python -m pip install pysam') from error
+    return pysam
+
+
+def count_bam(path, index, counts, pysam, strandedness='unstranded'):
+    """Count each primary alignment once per overlapping ORF, across all CDS bases."""
+    assigned = 0
+    with pysam.AlignmentFile(str(path), 'rb') as bam:
+        for read in bam.fetch(until_eof=True):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary or read.is_qcfail:
+                continue
+            strand = '-' if read.is_reverse else '+'
+            if strandedness != 'unstranded':
+                # Forward: read 1/single read agrees with transcript; read 2 is opposite.
+                if (read.is_paired and read.is_read2) != (strandedness == 'reverse'):
+                    strand = '+' if strand == '-' else '-'
+                strands = (strand,)
+            else:
+                strands = ('+', '-')
+            hits = set()
+            for start, end in read.get_blocks():
+                for target_strand in strands:
+                    bins = index.get((read.reference_name, target_strand), {})
+                    for bin_id in range(start // BIN_SIZE, (end - 1) // BIN_SIZE + 1):
+                        for exon_start, exon_end, _, row in bins.get(bin_id, ()):
+                            if start < exon_end and end > exon_start:
+                                hits.add(row)
+            for row in hits:
+                counts[row] += 1
+            assigned += len(hits)
+    if not assigned:
+        print(f'Warning: {path}: no RNA reads overlapped CDS; check chromosome names '
+              'and strandedness.', file=sys.stderr)
 
 
 def count_bedgraph(path, strand, index, counts, covered=None):
@@ -197,8 +266,10 @@ def format_metric(value):
     return format(value, '.15g') if math.isfinite(value) else 'NA'
 
 
-def write_tables(prefix, rows, samples, counts, target_total):
-    """Use one normalization factor per tissue, shared across all three frames."""
+def write_tables(prefix, rows, samples, counts, target_total, reads='ribo'):
+    """Normalize assigned counts per tissue; ribosome frames share one factor."""
+    stride = 3 if reads == 'ribo' else 1
+    specificity_columns = SPECIFICITY if reads == 'ribo' else RNA_SPECIFICITY
     factors = {}
     for tissue in samples:
         total = math.fsum(counts[tissue])
@@ -209,15 +280,16 @@ def write_tables(prefix, rows, samples, counts, target_total):
               f'{factors[tissue]:.12g}', file=sys.stderr)
     Path(prefix).parent.mkdir(parents=True, exist_ok=True)
     p0_specificity = []
-    for frame in range(3):
+    for frame in range(stride):
         for normalized in (False, True):
             suffix = '.normalized' if normalized else ''
-            path = f'{prefix}.p{frame}{suffix}.tsv'
+            component = f'p{frame}' if reads == 'ribo' else 'counts'
+            path = f'{prefix}.{component}{suffix}.tsv'
             with open(path, 'w', newline='', encoding='utf-8') as handle:
                 writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
-                writer.writerow((*METADATA, *samples, *(SPECIFICITY if normalized else ())))
+                writer.writerow((*METADATA, *samples, *(specificity_columns if normalized else ())))
                 for row_number, metadata in enumerate(rows):
-                    values = [counts[tissue][3 * row_number + frame] *
+                    values = [counts[tissue][stride * row_number + frame] *
                               (factors[tissue] if normalized else 1.0) for tissue in samples]
                     extra = ()
                     if normalized:
@@ -269,7 +341,6 @@ def plot_density_panel(ax, values, np):
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     ax.set_xlim(0, 1)
-    ax.set_ylim(bottom=0)
     ax.set_xticks([0, 0.5, 1])
     ax.text(0.97, 0.95, f'n={len(values):,}', transform=ax.transAxes,
             ha='right', va='top', fontsize=8)
@@ -297,9 +368,10 @@ def plot_density_panel(ax, values, np):
     y = np.concatenate(([density[0]], density, [density[-1]]))
     ax.plot(x, y, color='#2878a5', linewidth=1.2)
     ax.fill_between(x, y, color='#2878a5', alpha=0.25)
+    ax.set_ylim(bottom=0)
 
 
-def write_density_plots(prefix, rows, samples, periodicity, coverage, specificity):
+def write_density_plots(prefix, rows, samples, periodicity, coverage, specificity, reads='ribo'):
     np, plt = load_plotting()
     tissues = list(samples)
     biotypes = list(dict.fromkeys(row[1] for row in rows))
@@ -310,10 +382,13 @@ def write_density_plots(prefix, rows, samples, periodicity, coverage, specificit
         _, tau = specificity[i]
         if math.isfinite(tau):
             tau_groups[row[1]].append(tau)
-    for metric, label, data in (
+    metrics = (
             ('periodicity', 'Periodicity (p0 / all frames)', periodicity),
             ('coverage', 'Coverage (covered p0 positions / all p0 positions)', coverage),
-            ('tau_tissue_translation', 'Tissue specificity (tau, normalized p0)', None)):
+            ('tau_tissue_translation', 'Tissue specificity (tau, normalized p0)', None))
+    if reads == 'rna':
+        metrics = (('tau_tissue_expression', 'Tissue specificity (tau, normalized RNA counts)', None),)
+    for metric, label, data in metrics:
         columns = ['All tissues'] if data is None else tissues
         fig, axes = plt.subplots(len(biotypes), len(columns), squeeze=False,
                                  figsize=(max(4, 2.6 * len(columns)), 2.1 * len(biotypes) + 1),
@@ -353,7 +428,7 @@ def count_tissue_enrichment(rows, specificity):
     return enriched, specific
 
 
-def write_enrichment_barplot(prefix, rows, samples, specificity):
+def write_enrichment_barplot(prefix, rows, samples, specificity, reads='ribo'):
     np, plt = load_plotting()
     from matplotlib.ticker import MaxNLocator
 
@@ -377,7 +452,8 @@ def write_enrichment_barplot(prefix, rows, samples, specificity):
         ax.set_ylim(0, max(1, maximum * 1.2))
         ax.set_xticks(x)
         ax.set_xticklabels(tissues, rotation=45, ha='right')
-    axes[-1, 0].set_xlabel('Tissue of maximum normalized p0 translation')
+    axes[-1, 0].set_xlabel('Tissue of maximum normalized ' +
+                           ('p0 translation' if reads == 'ribo' else 'RNA count'))
     fig.suptitle('Tissue-enriched and tissue-specific ORFs by biotype', fontsize=12)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.96), ncol=2)
@@ -398,6 +474,28 @@ def main():
     --gtf ../human_nicos_20231005_pooled/collapsed/nicos_20231005.orfs.gtf \
     --bedgraphs checked_tissues.txt --out-prefix nicos_psites
 
+RNA-seq mode:
+  python count_orf_psites.py --reads rna --gtf orfs.gtf --input rna_bams.txt \
+    --out-prefix rna_counts
+  RNA list: one whitespace-separated 'bam_path tissue' per line. Relative paths
+  resolve against the list directory; multiple BAMs per tissue are pooled.
+  Requires pysam (python -m pip install pysam). BAM sorting/indexing is not required.
+  Each primary, mapped, QC-passing alignment counts once per overlapping ORF,
+  regardless of reading frame. Paired mates count separately. Duplicate-marked
+  reads are retained; secondary and supplementary alignments are excluded.
+  Only aligned bases count: skipped introns and deletions do not create overlaps.
+  Shared ORFs receive independent assignments, including for multimapping primary
+  alignments. Default is unstranded. --rna-strandedness forward means read 1 or
+  single-end reads agree with transcript strand; reverse means they oppose it.
+  Read 2 uses the opposite orientation to read 1.
+  Normalization scales total ORF-assigned reads per tissue to --target-total,
+  without length normalization. Tau and enrichment use normalized RNA counts.
+  RNA outputs: PREFIX.counts.tsv, PREFIX.counts.normalized.tsv (adds
+  max_tissue_expression and tau_tissue_expression),
+  PREFIX.tau_tissue_expression.density.pdf, PREFIX.tissue_enrichment.barplot.pdf.
+  No frames, periodicity, or coverage are computed in RNA mode.
+
+Ribo mode (default; remaining details describe ribo outputs):
 Input list: one whitespace-separated 'bedgraph_path tissue plus|minus' per line.
 The third column also accepts + or -. Blank lines and # comments are ignored.
 Paths without spaces are required; relative bedGraph paths resolve relative to
@@ -474,8 +572,12 @@ Outputs (existing files with these names are overwritten):
 ''')
     parser.add_argument('--gtf', required=True, type=Path,
                         help='ORF GTF: CDS features with orf_id/transcript_id attributes')
-    parser.add_argument('--bedgraphs', required=True, type=Path,
-                        help='three-column bedGraph list: path, tissue, strand')
+    parser.add_argument('--reads', choices=('ribo', 'rna'), default='ribo',
+                        help='input read type (default: ribo)')
+    parser.add_argument('--bedgraphs', '--input', dest='bedgraphs', required=True, type=Path,
+                        help='input list: path tissue strand for ribo; BAM_path tissue for rna')
+    parser.add_argument('--rna-strandedness', choices=('unstranded', 'forward', 'reverse'),
+                        default='unstranded', help='RNA library orientation (default: unstranded)')
     parser.add_argument('--out-prefix', required=True,
                         help='output path prefix, e.g. results/nicos_psites')
     parser.add_argument('--target-total', type=float, default=1_000_000,
@@ -488,12 +590,20 @@ Outputs (existing files with these names are overwritten):
     try:
         if not args.skip_plots:
             load_plotting()  # Fail before expensive counting if dependencies are missing.
-        samples = read_bedgraph_list(args.bedgraphs)
-        rows, index, lengths = read_gtf(args.gtf)
+        pysam = load_bam_reader() if args.reads == 'rna' else None
+        samples = (read_bam_list(args.bedgraphs) if args.reads == 'rna'
+                   else read_bedgraph_list(args.bedgraphs))
+        rows, index, lengths = read_gtf(args.gtf, args.reads)
         print(f'Loaded {len(rows)} ORF/transcript rows and {len(samples)} tissues.', file=sys.stderr)
         counts, coverage = {}, {}
         p0_positions = [(length + 2) // 3 for length in lengths]
         for tissue, entries in samples.items():
+            if args.reads == 'rna':
+                counts[tissue] = array('d', [0.0]) * len(rows)
+                for path in entries:
+                    print(f'Counting {tissue}: {path}', file=sys.stderr)
+                    count_bam(path, index, counts[tissue], pysam, args.rna_strandedness)
+                continue
             counts[tissue] = array('d', [0.0]) * (3 * len(rows))
             covered = [bytearray(size) for size in p0_positions]
             for path, strand in entries:
@@ -503,12 +613,13 @@ Outputs (existing files with these names are overwritten):
                                            for bitmap, size in zip(covered, p0_positions)))
             del covered
             report_cds_frames(tissue, rows, counts[tissue])
-        specificity = write_tables(args.out_prefix, rows, samples, counts, args.target_total)
-        periodicity = write_quality_table(args.out_prefix, rows, samples, counts, coverage)
+        specificity = write_tables(args.out_prefix, rows, samples, counts, args.target_total, args.reads)
+        periodicity = (write_quality_table(args.out_prefix, rows, samples, counts, coverage)
+                       if args.reads == 'ribo' else None)
         if not args.skip_plots:
             write_density_plots(args.out_prefix, rows, samples, periodicity, coverage,
-                                specificity)
-            write_enrichment_barplot(args.out_prefix, rows, samples, specificity)
+                                specificity, args.reads)
+            write_enrichment_barplot(args.out_prefix, rows, samples, specificity, args.reads)
     except (OSError, ValueError, OverflowError) as error:
         parser.exit(1, f'Error: {error}\n')
 
